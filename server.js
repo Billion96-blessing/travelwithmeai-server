@@ -41,6 +41,7 @@ const realtimeModel = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
 const transcribeModel = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
 const ttsModel = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
 const ttsVoice = process.env.OPENAI_TTS_VOICE || "marin";
+const ttsFormat = process.env.OPENAI_TTS_FORMAT || "wav";
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
 const maxRequestBytes = Number(process.env.MAX_REQUEST_BYTES || 8 * 1024 * 1024);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
@@ -103,6 +104,31 @@ function voiceLog(stage, details = {}) {
     at: new Date().toISOString(),
     ...details
   }));
+}
+
+function bufferHeaderHex(buffer, bytes = 16) {
+  return Buffer.from(buffer)
+    .subarray(0, bytes)
+    .toString("hex")
+    .match(/.{1,2}/g)
+    ?.join(" ") || "";
+}
+
+function mimeTypeForAudioFormat(format) {
+  switch (String(format || "").toLowerCase()) {
+    case "wav":
+      return "audio/wav";
+    case "aac":
+      return "audio/aac";
+    case "flac":
+      return "audio/flac";
+    case "opus":
+      return "audio/opus";
+    case "pcm":
+      return "audio/pcm";
+    default:
+      return "audio/mpeg";
+  }
 }
 
 function shouldRetry(status) {
@@ -692,6 +718,7 @@ async function transcribeVoiceTurn({ audioBase64, audioMimeType, providerLanguag
   voiceLog("audio_sent_to_openai_stt", {
     bytes: buffer.length,
     mimeType,
+    audioHeaderHex: bufferHeaderHex(buffer),
     providerLanguage,
     model: transcribeModel
   });
@@ -718,6 +745,7 @@ async function transcribeVoiceTurn({ audioBase64, audioMimeType, providerLanguag
   const transcript = (data.text || data.transcript || "").trim();
   voiceLog("stt_transcript_generated", {
     transcriptLength: transcript.length,
+    openAIContentType: response.headers.get("content-type") || "",
     model: transcribeModel
   });
 
@@ -858,7 +886,8 @@ async function synthesizeVoiceAudio(text) {
   voiceLog("tts_audio_requested", {
     textLength: cleanText.length,
     model: ttsModel,
-    voice: ttsVoice
+    voice: ttsVoice,
+    format: ttsFormat
   });
 
   const { response, body, contentType } = await fetchBinaryWithRetry(
@@ -873,7 +902,7 @@ async function synthesizeVoiceAudio(text) {
         model: ttsModel,
         voice: ttsVoice,
         input: cleanText,
-        response_format: "mp3"
+        response_format: ttsFormat
       })
     },
     { retries: 1, timeoutMs: requestTimeoutMs }
@@ -895,12 +924,19 @@ async function synthesizeVoiceAudio(text) {
 
   voiceLog("tts_audio_generated", {
     bytes: body.length,
+    contentType,
+    audioHeaderHex: bufferHeaderHex(body),
     model: ttsModel
   });
 
   return {
     audioBase64: body.toString("base64"),
-    audioMimeType: contentType.includes("audio/") ? contentType : "audio/mpeg"
+    audioMimeType: contentType.includes("audio/")
+      ? contentType
+      : mimeTypeForAudioFormat(ttsFormat),
+    audioByteLength: body.length,
+    audioHeaderHex: bufferHeaderHex(body),
+    audioContentType: contentType || mimeTypeForAudioFormat(ttsFormat)
   };
 }
 
@@ -966,9 +1002,12 @@ async function handleVoiceTurn(req, res) {
     }
 
     const providerLanguage = extractGoalField(cleanGoal, "Provider language") || "Thai";
+    const decodedAudio = Buffer.from(String(audioBase64), "base64");
     voiceLog("backend_received_audio", {
       base64Length: String(audioBase64).length,
+      decodedBytes: decodedAudio.length,
       audioMimeType: audioMimeType || "audio/mp4",
+      audioHeaderHex: bufferHeaderHex(decodedAudio),
       providerLanguage
     });
 
@@ -1106,6 +1145,7 @@ const server = http.createServer((req, res) => {
       transcribeModel,
       ttsModel,
       ttsVoice,
+      ttsFormat,
       voiceReady: Boolean(process.env.OPENAI_API_KEY),
       hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
     });
@@ -1352,11 +1392,23 @@ function handleNegotiatorSocket(clientSocket) {
       }
     });
 
-    openAiSocket.on("close", () => {
-      sendClient(clientSocket, { type: "status", message: "Negotiator disconnected." });
+    openAiSocket.on("close", (closeInfo = {}) => {
+      voiceLog("realtime_websocket_closed", {
+        code: closeInfo.code || "",
+        reason: closeInfo.reason || ""
+      });
+      sendClient(clientSocket, {
+        type: "status",
+        message: "Negotiator disconnected.",
+        code: closeInfo.code || "",
+        reason: closeInfo.reason || ""
+      });
     });
 
     openAiSocket.on("error", (error) => {
+      voiceLog("realtime_websocket_error", {
+        message: error.message
+      });
       sendClient(clientSocket, { type: "error", message: error.message });
     });
   }

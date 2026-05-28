@@ -63,8 +63,9 @@ export class SimpleWebSocket {
       this.buffer = this.buffer.subarray(decoded.nextOffset);
 
       if (decoded.opcode === 8) {
+        const closeInfo = parseClosePayload(decoded.payload);
         this.close();
-        this.emit("close");
+        this.emit("close", closeInfo);
         break;
       }
 
@@ -84,6 +85,17 @@ export class SimpleWebSocket {
       }
     }
   }
+}
+
+function parseClosePayload(payload) {
+  if (!payload || payload.length < 2) {
+    return { code: 1005, reason: "" };
+  }
+
+  return {
+    code: payload.readUInt16BE(0),
+    reason: payload.subarray(2).toString("utf8")
+  };
 }
 
 export function acceptWebSocketUpgrade(req, socket, head, onConnection) {
