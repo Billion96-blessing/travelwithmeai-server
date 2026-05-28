@@ -31,6 +31,7 @@ http://127.0.0.1:3000
 
 Use these settings in Render:
 
+- Service type: Web Service
 - Runtime: Node
 - Build command: `npm install`
 - Start command: `npm start`
@@ -44,6 +45,18 @@ OPENAI_REALTIME_MODEL=gpt-realtime
 ```
 
 Do not commit `.env`. Render should store secrets in its environment settings.
+
+Production health check:
+
+```text
+GET /api/health
+```
+
+The Flutter app should use `https://travelwithmeai-server.onrender.com` by default. When the custom domain is ready, rebuild the app with:
+
+```bash
+flutter build apk --release --dart-define=TRAVELWITHMEAI_API_BASE_URL=https://api.travelwithmeai.com
+```
 
 ## Features
 

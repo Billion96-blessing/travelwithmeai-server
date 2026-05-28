@@ -516,6 +516,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/api/health") {
+    sendJson(res, 200, {
+      ok: true,
+      service: "travelwithmeai-server",
+      model,
+      realtimeModel,
+      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/api/assistant") {
     handleAssistant(req, res);
     return;
