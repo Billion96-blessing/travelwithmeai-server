@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Assistant</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="history-panel" aria-label="Chat history">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <p class="eyebrow">Neural Desk</p>
+            <h1>AI Assistant</h1>
+          </div>
+        </div>
+
+        <button id="newChatButton" class="primary-action" type="button">New chat</button>
+
+        <nav class="history-list" aria-label="Saved chats">
+          <p class="section-label">Recent chats</p>
+          <div id="chatHistory"></div>
+        </nav>
+
+        <div class="control-grid">
+          <label for="tone">Response style</label>
+          <select id="tone">
+            <option value="balanced">Balanced</option>
+            <option value="concise">Concise</option>
+            <option value="creative">Creative</option>
+            <option value="technical">Technical</option>
+          </select>
+        </div>
+      </aside>
+
+      <section class="assistant-panel" aria-label="AI chat">
+        <header class="top-bar">
+          <button id="sidebarToggle" class="icon-button" type="button" title="Toggle history" aria-label="Toggle history">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+
+          <div>
+            <p class="eyebrow">Negotiator Console</p>
+            <h2>AI Voice Negotiator</h2>
+          </div>
+
+          <div class="status-cluster">
+            <span class="signal-dot" aria-hidden="true"></span>
+            <span>Online</span>
+          </div>
+        </header>
+
+        <section class="voice-lab" aria-label="Realtime voice negotiator">
+          <div class="voice-copy">
+            <p class="eyebrow">Realtime Voice Test</p>
+            <h3>Negotiate in Thai</h3>
+            <p>Enter your private goal, press Start, allow microphone access, then let the AI speak with the provider in Thai. It will not finalize until you approve.</p>
+          </div>
+
+          <div class="goal-box">
+            <label for="negotiationGoal">Private goal</label>
+            <textarea id="negotiationGoal" rows="3">Hire a boat for 4 people, 2 hours, best fair price. Ask about safety, pickup, drop-off, inclusions, and discount.</textarea>
+          </div>
+
+          <div class="voice-controls">
+            <button id="startRealtime" class="live-button" type="button">
+              <span class="pulse-dot" aria-hidden="true"></span>
+              Start voice
+            </button>
+            <button id="stopRealtime" class="secondary-button" type="button" disabled>Stop</button>
+            <button id="approveDeal" class="secondary-button approve-button" type="button" disabled>Approve deal</button>
+          </div>
+
+          <div class="negotiator-grid">
+            <article class="mini-panel">
+              <span class="panel-label">Status</span>
+              <p id="realtimeStatus">Ready for realtime voice test.</p>
+            </article>
+            <article class="mini-panel">
+              <span class="panel-label">AI Thai voice transcript</span>
+              <p id="realtimeTranscript">Waiting for Start voice.</p>
+            </article>
+            <article class="mini-panel">
+              <span class="panel-label">Trip Notes</span>
+              <p id="tripNotes">No approved deal yet.</p>
+            </article>
+          </div>
+
+          <audio id="realtimeAudio" autoplay></audio>
+        </section>
+
+        <div class="quick-prompts" aria-label="Quick prompts">
+          <button type="button" data-prompt="Plan a mobile AI assistant app with screens, features, and data flow.">Plan app</button>
+          <button type="button" data-prompt="Rewrite this in a polished futuristic product style:">Rewrite</button>
+          <button type="button" data-prompt="Translate this into Thai and keep the tone natural:">Translate</button>
+          <button type="button" data-prompt="Explain this code and suggest improvements:">Explain code</button>
+        </div>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="chatForm" class="composer">
+          <button id="voiceButton" class="icon-action" type="button" title="Voice input" aria-label="Voice input">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3Z" />
+              <path d="M19 11a7 7 0 0 1-14 0" />
+              <path d="M12 18v3" />
+              <path d="M8 21h8" />
+            </svg>
+          </button>
+
+          <textarea id="messageInput" rows="1" placeholder="Message the assistant..." required></textarea>
+
+          <button id="sendButton" type="submit">
+            <span>Send</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m5 12 14-7-4 14-3-6-7-1Z" />
+            </svg>
+          </button>
+        </form>
+
+        <p id="voiceStatus" class="voice-status">Voice input is ready.</p>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
