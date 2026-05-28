@@ -38,8 +38,11 @@ const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || "0.0.0.0";
 const model = process.env.OPENAI_MODEL || "gpt-5-mini";
 const realtimeModel = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
+const transcribeModel = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+const ttsModel = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
+const ttsVoice = process.env.OPENAI_TTS_VOICE || "marin";
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
-const maxRequestBytes = Number(process.env.MAX_REQUEST_BYTES || 1024 * 1024);
+const maxRequestBytes = Number(process.env.MAX_REQUEST_BYTES || 8 * 1024 * 1024);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((origin) => origin.trim())
@@ -92,6 +95,16 @@ function publicError(error, fallback = "Service temporarily unavailable.") {
   return error.publicMessage || fallback;
 }
 
+function voiceLog(stage, details = {}) {
+  console.log(JSON.stringify({
+    service: "travelwithmeai-server",
+    area: "voice",
+    stage,
+    at: new Date().toISOString(),
+    ...details
+  }));
+}
+
 function shouldRetry(status) {
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
 }
@@ -120,6 +133,39 @@ async function fetchJsonWithRetry(url, options, { retries = 2, timeoutMs = reque
       }
 
       return { response, data };
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) break;
+      await wait(300 * (attempt + 1));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error("Request failed.");
+}
+
+async function fetchBinaryWithRetry(url, options, { retries = 2, timeoutMs = requestTimeoutMs } = {}) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+
+      if (!response.ok && attempt < retries && shouldRetry(response.status)) {
+        await wait(300 * (attempt + 1));
+        continue;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      const body = Buffer.from(await response.arrayBuffer());
+      return { response, body, contentType };
     } catch (error) {
       lastError = error;
       if (attempt >= retries) break;
@@ -165,6 +211,37 @@ function parseNegotiatorResponse(text) {
   }
 
   return JSON.parse(jsonMatch[0]);
+}
+
+function parseJsonObject(text, fallback) {
+  const jsonMatch = String(text || "").match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return fallback;
+
+  try {
+    return { ...fallback, ...JSON.parse(jsonMatch[0]) };
+  } catch {
+    return fallback;
+  }
+}
+
+function audioExtensionFromMime(mimeType = "") {
+  const normalized = mimeType.toLowerCase();
+  if (normalized.includes("webm")) return "webm";
+  if (normalized.includes("wav")) return "wav";
+  if (normalized.includes("mpeg") || normalized.includes("mp3")) return "mp3";
+  if (normalized.includes("aac")) return "aac";
+  return "m4a";
+}
+
+function providerLanguageCode(language = "") {
+  const normalized = language.toLowerCase();
+  if (normalized.includes("thai")) return "th";
+  if (normalized.includes("english")) return "en";
+  if (normalized.includes("burmese") || normalized.includes("myanmar")) return "my";
+  if (normalized.includes("chinese") || normalized.includes("mandarin")) return "zh";
+  if (normalized.includes("japanese")) return "ja";
+  if (normalized.includes("korean")) return "ko";
+  return "";
 }
 
 async function readBody(req) {
@@ -590,6 +667,414 @@ async function handleRealtimeToken(req, res) {
   }
 }
 
+async function transcribeVoiceTurn({ audioBase64, audioMimeType, providerLanguage }) {
+  const buffer = Buffer.from(String(audioBase64 || ""), "base64");
+  if (buffer.length < 1200) {
+    const error = new Error("Audio recording is too short.");
+    error.status = 400;
+    error.publicMessage = "I could not hear enough audio. Please try again.";
+    throw error;
+  }
+
+  const mimeType = audioMimeType || "audio/mp4";
+  const fileName = `voice-turn.${audioExtensionFromMime(mimeType)}`;
+  const form = new FormData();
+  form.append("model", transcribeModel);
+  form.append("response_format", "json");
+
+  const languageCode = providerLanguageCode(providerLanguage);
+  if (languageCode) {
+    form.append("language", languageCode);
+  }
+
+  form.append("file", new Blob([buffer], { type: mimeType }), fileName);
+
+  voiceLog("audio_sent_to_openai_stt", {
+    bytes: buffer.length,
+    mimeType,
+    providerLanguage,
+    model: transcribeModel
+  });
+
+  const { response, data } = await fetchJsonWithRetry(
+    "https://api.openai.com/v1/audio/transcriptions",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: form
+    },
+    { retries: 1, timeoutMs: requestTimeoutMs }
+  );
+
+  if (!response.ok) {
+    const error = new Error(data.error?.message || "Transcription failed.");
+    error.status = response.status;
+    error.publicMessage = "Speech transcription failed. Please try again.";
+    throw error;
+  }
+
+  const transcript = (data.text || data.transcript || "").trim();
+  voiceLog("stt_transcript_generated", {
+    transcriptLength: transcript.length,
+    model: transcribeModel
+  });
+
+  if (!transcript) {
+    const error = new Error("No speech detected.");
+    error.status = 422;
+    error.publicMessage = "I could not hear clear speech. Please try again.";
+    throw error;
+  }
+
+  return transcript;
+}
+
+async function generateVoiceStartReply(goal) {
+  const providerLanguage = extractGoalField(goal, "Provider language") || "Thai";
+  const userLanguage = extractGoalField(goal, "User translation language") || "English";
+
+  const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      instructions: [
+        "You write the first spoken line for TravelBuddy AI negotiation mode.",
+        `The provider-facing line must be in ${providerLanguage}.`,
+        `Also provide a ${userLanguage} translation for the user.`,
+        "The provider-facing line must be short, polite, direct, and human-like.",
+        "Say you are helping your friend/customer communicate, briefly state the service wanted, then ask the price.",
+        "Do not mention the private target price or maximum budget.",
+        "Return only valid JSON with keys: aiReply, aiTranslation, needsUserApproval, status."
+      ].join(" "),
+      input: JSON.stringify({
+        privateUserGoal: goal,
+        firstTurn: true,
+        requestSummary: buildUserRequestSummary(goal)
+      }),
+      max_output_tokens: 450
+    })
+  });
+
+  if (!response.ok) {
+    const error = new Error(data.error?.message || "AI reply failed.");
+    error.status = response.status;
+    error.publicMessage = "AI could not prepare the first voice reply.";
+    throw error;
+  }
+
+  const fallback = {
+    aiReply: providerLanguage.toLowerCase().includes("thai")
+      ? `สวัสดีครับ ผมช่วยเพื่อนสื่อสารนะครับ ขอสอบถามราคาสำหรับ ${buildUserRequestSummary(goal)} หน่อยครับ`
+      : `Hi, I am helping my friend communicate. How much is ${buildUserRequestSummary(goal)}?`,
+    aiTranslation: `Hi, I am helping my friend communicate. May I ask the price for ${buildUserRequestSummary(goal)}?`,
+    needsUserApproval: false,
+    status: "negotiating"
+  };
+  const parsed = parseJsonObject(getResponseText(data), fallback);
+  voiceLog("ai_start_text_generated", {
+    replyLength: String(parsed.aiReply || "").length,
+    model
+  });
+  return parsed;
+}
+
+async function generateVoiceNegotiatorReply({ goal, providerTranscript, conversation }) {
+  const providerLanguage = extractGoalField(goal, "Provider language") || "Thai";
+  const userLanguage = extractGoalField(goal, "User translation language") || "English";
+
+  const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      instructions: [
+        "You are TravelBuddy AI voice negotiator for a traveler.",
+        `Reply to the service provider only in ${providerLanguage}.`,
+        `Translate the provider message and your reply for the user in ${userLanguage}.`,
+        "Speak like a helpful human assistant, not a robot.",
+        "Keep the provider-facing reply short, polite, direct, and natural.",
+        "Ask price first, then discount/final price, then only details relevant to the service type.",
+        "Taxi: ask toll fee, waiting fee, pickup/drop-off, luggage, route, extra charge.",
+        "Boat: ask life jacket, island fee, round trip, duration, pickup point, safety.",
+        "Hotel: ask breakfast, tax, deposit, late checkout.",
+        "Shopping: ask discount, warranty, original/fake, delivery.",
+        "Do not confirm or finalize the deal until the user approves in the app.",
+        "If the provider offer seems ready, say a short version of: okay, let me ask my friend first.",
+        "Return only valid JSON with keys: providerTranslation, aiReply, aiTranslation, needsUserApproval, finalNote, status."
+      ].join(" "),
+      input: JSON.stringify({
+        privateUserGoal: goal,
+        providerTranscript,
+        recentConversation: Array.isArray(conversation) ? conversation.slice(-12) : []
+      }),
+      max_output_tokens: 650
+    })
+  });
+
+  if (!response.ok) {
+    const error = new Error(data.error?.message || "AI reply failed.");
+    error.status = response.status;
+    error.publicMessage = "AI could not generate a voice reply.";
+    throw error;
+  }
+
+  const fallback = {
+    providerTranslation: providerTranscript,
+    aiReply: providerLanguage.toLowerCase().includes("thai")
+      ? "ลดได้อีกหน่อยไหมครับ ราคาสุดท้ายเท่าไหร่ครับ"
+      : "Can you reduce a little? What is the final price?",
+    aiTranslation: "Can you reduce a little? What is the final price?",
+    needsUserApproval: false,
+    finalNote: "",
+    status: "negotiating"
+  };
+  const parsed = parseJsonObject(getResponseText(data), fallback);
+  voiceLog("ai_text_generated", {
+    providerTranscriptLength: providerTranscript.length,
+    replyLength: String(parsed.aiReply || "").length,
+    model
+  });
+  return parsed;
+}
+
+async function synthesizeVoiceAudio(text) {
+  const cleanText = String(text || "").trim();
+  if (!cleanText) {
+    const error = new Error("No text for speech.");
+    error.status = 400;
+    error.publicMessage = "AI voice had no text to speak.";
+    throw error;
+  }
+
+  voiceLog("tts_audio_requested", {
+    textLength: cleanText.length,
+    model: ttsModel,
+    voice: ttsVoice
+  });
+
+  const { response, body, contentType } = await fetchBinaryWithRetry(
+    "https://api.openai.com/v1/audio/speech",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: ttsModel,
+        voice: ttsVoice,
+        input: cleanText,
+        response_format: "mp3"
+      })
+    },
+    { retries: 1, timeoutMs: requestTimeoutMs }
+  );
+
+  if (!response.ok) {
+    let message = "Text-to-speech failed.";
+    try {
+      const data = JSON.parse(body.toString("utf8"));
+      message = data.error?.message || message;
+    } catch {
+      message = body.toString("utf8").slice(0, 180) || message;
+    }
+    const error = new Error(message);
+    error.status = response.status;
+    error.publicMessage = "AI voice generation failed. Please try again.";
+    throw error;
+  }
+
+  voiceLog("tts_audio_generated", {
+    bytes: body.length,
+    model: ttsModel
+  });
+
+  return {
+    audioBase64: body.toString("base64"),
+    audioMimeType: contentType.includes("audio/") ? contentType : "audio/mpeg"
+  };
+}
+
+async function handleVoiceStart(req, res) {
+  if (!process.env.OPENAI_API_KEY) {
+    sendJson(res, 500, {
+      error: "Missing OPENAI_API_KEY. Add it to the backend environment variables."
+    });
+    return;
+  }
+
+  try {
+    const { goal } = await readBody(req);
+    const cleanGoal = String(goal || "").trim();
+    if (!cleanGoal) {
+      sendJson(res, 400, { error: "Negotiation goal is required." });
+      return;
+    }
+
+    voiceLog("voice_session_start", {
+      providerLanguage: extractGoalField(cleanGoal, "Provider language") || "Thai"
+    });
+    const reply = await generateVoiceStartReply(cleanGoal);
+    const audio = await synthesizeVoiceAudio(reply.aiReply);
+
+    sendJson(res, 200, {
+      mode: "voice",
+      providerTranscript: "",
+      providerTranslation: "",
+      aiReply: reply.aiReply,
+      aiTranslation: reply.aiTranslation,
+      needsUserApproval: Boolean(reply.needsUserApproval),
+      status: reply.status || "negotiating",
+      ...audio
+    });
+  } catch (error) {
+    voiceLog("voice_start_error", {
+      status: error.status || 500,
+      message: error.message
+    });
+    sendJson(res, error.status || 500, { error: publicError(error) });
+  }
+}
+
+async function handleVoiceTurn(req, res) {
+  if (!process.env.OPENAI_API_KEY) {
+    sendJson(res, 500, {
+      error: "Missing OPENAI_API_KEY. Add it to the backend environment variables."
+    });
+    return;
+  }
+
+  try {
+    const { goal, audioBase64, audioMimeType, conversation } = await readBody(req);
+    const cleanGoal = String(goal || "").trim();
+    if (!cleanGoal) {
+      sendJson(res, 400, { error: "Negotiation goal is required." });
+      return;
+    }
+    if (!audioBase64) {
+      sendJson(res, 400, { error: "Audio is required." });
+      return;
+    }
+
+    const providerLanguage = extractGoalField(cleanGoal, "Provider language") || "Thai";
+    voiceLog("backend_received_audio", {
+      base64Length: String(audioBase64).length,
+      audioMimeType: audioMimeType || "audio/mp4",
+      providerLanguage
+    });
+
+    const providerTranscript = await transcribeVoiceTurn({
+      audioBase64,
+      audioMimeType,
+      providerLanguage
+    });
+    const reply = await generateVoiceNegotiatorReply({
+      goal: cleanGoal,
+      providerTranscript,
+      conversation
+    });
+    const audio = await synthesizeVoiceAudio(reply.aiReply);
+
+    sendJson(res, 200, {
+      mode: "voice",
+      providerTranscript,
+      providerTranslation: reply.providerTranslation || providerTranscript,
+      aiReply: reply.aiReply,
+      aiTranslation: reply.aiTranslation || reply.aiReply,
+      needsUserApproval: Boolean(reply.needsUserApproval),
+      finalNote: reply.finalNote || "",
+      status: reply.status || "negotiating",
+      ...audio
+    });
+  } catch (error) {
+    voiceLog("voice_turn_error", {
+      status: error.status || 500,
+      message: error.message
+    });
+    sendJson(res, error.status || 500, { error: publicError(error) });
+  }
+}
+
+async function handleVoiceGoal(req, res) {
+  if (!process.env.OPENAI_API_KEY) {
+    sendJson(res, 500, {
+      error: "Missing OPENAI_API_KEY. Add it to the backend environment variables."
+    });
+    return;
+  }
+
+  try {
+    const { audioBase64, audioMimeType, userLanguage } = await readBody(req);
+    if (!audioBase64) {
+      sendJson(res, 400, { error: "Audio is required." });
+      return;
+    }
+
+    const transcript = await transcribeVoiceTurn({
+      audioBase64,
+      audioMimeType,
+      providerLanguage: userLanguage || "English"
+    });
+
+    const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        instructions: [
+          "Extract a travel negotiation goal from a user's spoken request.",
+          "Return only valid JSON with keys: destination, activity, people, budget, notes.",
+          "Leave unknown fields as empty strings."
+        ].join(" "),
+        input: transcript,
+        max_output_tokens: 300
+      })
+    });
+
+    if (!response.ok) {
+      sendJson(res, response.status, {
+        error: data.error?.message || "Goal extraction failed."
+      });
+      return;
+    }
+
+    const parsed = parseJsonObject(getResponseText(data), {
+      destination: "",
+      activity: transcript,
+      people: "",
+      budget: "",
+      notes: ""
+    });
+
+    sendJson(res, 200, {
+      transcript,
+      destination: parsed.destination || "",
+      activity: parsed.activity || transcript,
+      people: parsed.people || "",
+      budget: parsed.budget || "",
+      notes: parsed.notes || ""
+    });
+  } catch (error) {
+    voiceLog("voice_goal_error", {
+      status: error.status || 500,
+      message: error.message
+    });
+    sendJson(res, error.status || 500, { error: publicError(error) });
+  }
+}
+
 function extractGoalField(goal, fieldName) {
   const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = String(goal || "").match(new RegExp(`${escaped}:\\s*([^\\n]+)`, "i"));
@@ -618,6 +1103,10 @@ const server = http.createServer((req, res) => {
       service: "travelwithmeai-server",
       model,
       realtimeModel,
+      transcribeModel,
+      ttsModel,
+      ttsVoice,
+      voiceReady: Boolean(process.env.OPENAI_API_KEY),
       hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
     });
     return;
@@ -645,6 +1134,21 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "POST" && req.url === "/api/realtime-token") {
     handleRealtimeToken(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/voice-start") {
+    handleVoiceStart(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/voice-turn") {
+    handleVoiceTurn(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/voice-goal") {
+    handleVoiceGoal(req, res);
     return;
   }
 
