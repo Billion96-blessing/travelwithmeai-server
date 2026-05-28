@@ -12,3 +12,9 @@ services:
         value: gpt-5-mini
       - key: OPENAI_REALTIME_MODEL
         value: gpt-realtime
+      - key: NODE_ENV
+        value: production
+      - key: REQUEST_TIMEOUT_MS
+        value: 30000
+      - key: ALLOWED_ORIGINS
+        value: https://travelwithmeai-server.onrender.com,https://api.travelwithmeai.com

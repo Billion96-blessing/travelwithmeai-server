@@ -38,6 +38,12 @@ const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || "0.0.0.0";
 const model = process.env.OPENAI_MODEL || "gpt-5-mini";
 const realtimeModel = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
+const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+const maxRequestBytes = Number(process.env.MAX_REQUEST_BYTES || 1024 * 1024);
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -50,17 +56,80 @@ const mimeTypes = {
 function sendJson(res, status, payload) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
+    ...securityHeaders(),
     ...corsHeaders()
   });
   res.end(JSON.stringify(payload));
 }
 
-function corsHeaders() {
+function corsHeaders(origin = "") {
+  const allowOrigin =
+    allowedOrigins.includes("*") || !origin || allowedOrigins.includes(origin)
+      ? (allowedOrigins.includes("*") ? "*" : origin)
+      : allowedOrigins[0] || "";
+
   return {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Vary": "Origin"
   };
+}
+
+function securityHeaders() {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "microphone=(self)",
+    "Cross-Origin-Opener-Policy": "same-origin"
+  };
+}
+
+function publicError(error, fallback = "Service temporarily unavailable.") {
+  if (error.name === "AbortError" || error.code === "TIMEOUT") {
+    return "The request timed out. Please try again.";
+  }
+  return error.publicMessage || fallback;
+}
+
+function shouldRetry(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+async function wait(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJsonWithRetry(url, options, { retries = 2, timeoutMs = requestTimeoutMs } = {}) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok && attempt < retries && shouldRetry(response.status)) {
+        await wait(300 * (attempt + 1));
+        continue;
+      }
+
+      return { response, data };
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) break;
+      await wait(300 * (attempt + 1));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error("Request failed.");
 }
 
 function writeSse(res, event, data) {
@@ -100,8 +169,27 @@ function parseNegotiatorResponse(text) {
 
 async function readBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  let size = 0;
+
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxRequestBytes) {
+      const error = new Error("Request body is too large.");
+      error.status = 413;
+      error.publicMessage = "Request body is too large.";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    const error = new Error("Invalid JSON body.");
+    error.status = 400;
+    error.publicMessage = "Invalid JSON body.";
+    throw error;
+  }
 }
 
 async function serveStatic(req, res) {
@@ -119,7 +207,8 @@ async function serveStatic(req, res) {
   try {
     const file = await readFile(filePath);
     res.writeHead(200, {
-      "Content-Type": mimeTypes[extname(filePath)] || "application/octet-stream"
+      "Content-Type": mimeTypes[extname(filePath)] || "application/octet-stream",
+      ...securityHeaders()
     });
     res.end(file);
   } catch {
@@ -154,7 +243,7 @@ async function handleAssistant(req, res) {
       content: message.content
     }));
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -172,7 +261,6 @@ async function handleAssistant(req, res) {
       })
     });
 
-    const data = await response.json();
     if (!response.ok) {
       sendJson(res, response.status, {
         error: data.error?.message || "OpenAI request failed."
@@ -185,7 +273,7 @@ async function handleAssistant(req, res) {
       model
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Unexpected server error." });
+    sendJson(res, error.status || 500, { error: publicError(error) });
   }
 }
 
@@ -224,8 +312,11 @@ async function handleAssistantStream(req, res) {
       content: message.content
     }));
 
+    const streamController = new AbortController();
+    const streamTimeout = setTimeout(() => streamController.abort(), requestTimeoutMs * 2);
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
+      signal: streamController.signal,
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
         "Content-Type": "application/json"
@@ -243,6 +334,8 @@ async function handleAssistantStream(req, res) {
         max_output_tokens: 1200
       })
     });
+
+    clearTimeout(streamTimeout);
 
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
@@ -292,7 +385,7 @@ async function handleAssistantStream(req, res) {
     }
     res.end();
   } catch (error) {
-    writeSse(res, "error", { error: error.message || "Unexpected server error." });
+    writeSse(res, "error", { error: publicError(error) });
     res.end();
   }
 }
@@ -315,7 +408,7 @@ async function handleTranslate(req, res) {
       return;
     }
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -333,7 +426,6 @@ async function handleTranslate(req, res) {
       })
     });
 
-    const data = await response.json();
     if (!response.ok) {
       sendJson(res, response.status, {
         error: data.error?.message || "Translation request failed."
@@ -346,7 +438,7 @@ async function handleTranslate(req, res) {
       model
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Unexpected server error." });
+    sendJson(res, error.status || 500, { error: publicError(error) });
   }
 }
 
@@ -367,7 +459,7 @@ async function handleNegotiator(req, res) {
       return;
     }
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -397,7 +489,6 @@ async function handleNegotiator(req, res) {
       })
     });
 
-    const data = await response.json();
     if (!response.ok) {
       sendJson(res, response.status, {
         error: data.error?.message || "Negotiator request failed."
@@ -407,7 +498,7 @@ async function handleNegotiator(req, res) {
 
     sendJson(res, 200, parseNegotiatorResponse(getResponseText(data)));
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Unexpected server error." });
+    sendJson(res, error.status || 500, { error: publicError(error) });
   }
 }
 
@@ -454,7 +545,7 @@ async function handleRealtimeToken(req, res) {
           "Speak naturally, keep answers concise, and help with chat, translation, planning, and everyday tasks."
         ].join(" ");
 
-    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+    const { response, data } = await fetchJsonWithRetry("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -483,7 +574,6 @@ async function handleRealtimeToken(req, res) {
       })
     });
 
-    const data = await response.json();
     if (!response.ok) {
       sendJson(res, response.status, {
         error: data.error?.message || "Realtime token request failed."
@@ -493,7 +583,7 @@ async function handleRealtimeToken(req, res) {
 
     sendJson(res, 200, data);
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Unexpected server error." });
+    sendJson(res, error.status || 500, { error: publicError(error) });
   }
 }
 
@@ -511,7 +601,10 @@ function buildUserRequestSummary(goal) {
 
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
-    res.writeHead(204, corsHeaders());
+    res.writeHead(204, {
+      ...securityHeaders(),
+      ...corsHeaders(req.headers.origin)
+    });
     res.end();
     return;
   }
@@ -560,6 +653,10 @@ const server = http.createServer((req, res) => {
   res.writeHead(405);
   res.end("Method not allowed");
 });
+
+server.requestTimeout = requestTimeoutMs + 5000;
+server.headersTimeout = requestTimeoutMs + 10000;
+server.keepAliveTimeout = 65000;
 
 function buildNegotiatorInstructions(providerLanguage, userLanguage, goal = "") {
   return [
@@ -740,7 +837,13 @@ function handleNegotiatorSocket(clientSocket) {
   }
 
   clientSocket.on("message", (raw) => {
-    const message = JSON.parse(raw.toString());
+    let message;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      sendClient(clientSocket, { type: "error", message: "Invalid realtime message." });
+      return;
+    }
 
     if (message.type === "start") {
       connectOpenAI(message.goal || "");
@@ -787,8 +890,4 @@ server.on("upgrade", (req, socket, head) => {
   socket.destroy();
 });
 
-server.listen(port, host, () => {
-  console.log(`AI Assistant app running at http://${host}:${port}`);
-  console.log(`Using model: ${model}`);
-  console.log(`Using realtime model: ${realtimeModel}`);
-});
+server.listen(port, host);
