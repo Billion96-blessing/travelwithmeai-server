@@ -527,6 +527,8 @@ async function handleRealtimeToken(req, res) {
           "After the first message, negotiate on behalf of the user.",
           "Talk like a normal helpful person, not like a robot or formal assistant.",
           "Close the deal faster. Keep each turn under one short sentence when possible.",
+          "Use natural pacing and adapt emotional tone to the provider: warm, calm, and confident.",
+          "Handle interruptions naturally. If the provider interrupts, stop and listen.",
           "Use short questions: Can you reduce a little? Is that the final price? What is included? Pickup included? Any extra fee?",
           "Use direct counteroffers like: Can you do 1500?",
           "If the deal sounds ready, say: Okay, let me ask my friend first.",
@@ -669,6 +671,8 @@ function buildNegotiatorInstructions(providerLanguage, userLanguage, goal = "") 
     "After the first message, negotiate on behalf of the user.",
     "Talk like a normal helpful person, not like a robot or formal assistant.",
     "Close the deal faster. Keep each turn under one short sentence when possible.",
+    "Use natural pacing and adapt emotional tone to the provider: warm, calm, and confident.",
+    "Handle interruptions naturally. If the provider interrupts, stop and listen.",
     "Use short questions: Can you reduce a little? Is that the final price? What is included? Pickup included? Any extra fee?",
     "Use direct counteroffers like: Can you do 1500?",
     "If the deal sounds ready, say: Okay, let me ask my friend first.",
@@ -711,7 +715,7 @@ function buildNegotiatorSession(goal) {
             type: "server_vad",
             threshold: 0.55,
             prefix_padding_ms: 300,
-            silence_duration_ms: 550,
+            silence_duration_ms: 420,
             create_response: true,
             interrupt_response: true
           }
@@ -767,7 +771,16 @@ function handleNegotiatorSocket(clientSocket) {
   let openAiSocket = null;
   let privateGoal = "";
   let userApproved = false;
+  let lastClientMessageAt = Date.now();
   const transcript = [];
+  const heartbeat = setInterval(() => {
+    if (Date.now() - lastClientMessageAt > 45000) {
+      sendClient(clientSocket, {
+        type: "status",
+        message: "Connection alive. Waiting for audio..."
+      });
+    }
+  }, 30000);
 
   function connectOpenAI(goal) {
     if (!process.env.OPENAI_API_KEY) {
@@ -793,7 +806,13 @@ function handleNegotiatorSocket(clientSocket) {
     });
 
     openAiSocket.on("message", (raw) => {
-      const event = JSON.parse(raw.toString());
+      let event;
+      try {
+        event = JSON.parse(raw.toString());
+      } catch {
+        sendClient(clientSocket, { type: "error", message: "Realtime event parse failed." });
+        return;
+      }
 
       if (event.type === "response.audio.delta" || event.type === "response.output_audio.delta") {
         sendClient(clientSocket, { type: "audio_delta", audio: event.delta });
@@ -839,6 +858,7 @@ function handleNegotiatorSocket(clientSocket) {
   }
 
   clientSocket.on("message", (raw) => {
+    lastClientMessageAt = Date.now();
     let message;
     try {
       message = JSON.parse(raw.toString());
@@ -877,6 +897,12 @@ function handleNegotiatorSocket(clientSocket) {
   });
 
   clientSocket.on("close", () => {
+    clearInterval(heartbeat);
+    openAiSocket?.close();
+  });
+
+  clientSocket.on("error", () => {
+    clearInterval(heartbeat);
     openAiSocket?.close();
   });
 }

@@ -3,6 +3,7 @@ import tls from "node:tls";
 
 export class SimpleWebSocket {
   static OPEN = 1;
+  static CLOSED = 3;
 
   constructor(socket, { maskOutgoing = false } = {}) {
     this.socket = socket;
@@ -12,8 +13,15 @@ export class SimpleWebSocket {
     this.buffer = Buffer.alloc(0);
 
     socket.on("data", (chunk) => this.handleData(chunk));
-    socket.on("close", () => this.emit("close"));
-    socket.on("end", () => this.emit("close"));
+    socket.setKeepAlive?.(true, 30000);
+    socket.on("close", () => {
+      this.readyState = SimpleWebSocket.CLOSED;
+      this.emit("close");
+    });
+    socket.on("end", () => {
+      this.readyState = SimpleWebSocket.CLOSED;
+      this.emit("close");
+    });
     socket.on("error", (error) => this.emit("error", error));
   }
 
@@ -39,7 +47,7 @@ export class SimpleWebSocket {
 
   close() {
     if (this.readyState !== SimpleWebSocket.OPEN) return;
-    this.readyState = 3;
+    this.readyState = SimpleWebSocket.CLOSED;
     this.socket.end(encodeFrame(Buffer.alloc(0), {
       mask: this.maskOutgoing,
       opcode: 8
@@ -58,6 +66,17 @@ export class SimpleWebSocket {
         this.close();
         this.emit("close");
         break;
+      }
+
+      if (decoded.opcode === 9) {
+        this.socket.write(encodeFrame(decoded.payload, {
+          mask: this.maskOutgoing,
+          opcode: 10
+        }));
+      }
+
+      if (decoded.opcode === 10) {
+        this.emit("pong");
       }
 
       if (decoded.opcode === 1) {
