@@ -164,6 +164,7 @@ export function connectRealtimeWebSocket({ apiKey, model }) {
       `Sec-WebSocket-Key: ${key}`,
       "Sec-WebSocket-Version: 13",
       `Authorization: Bearer ${apiKey}`,
+      "OpenAI-Beta: realtime=v1",
       "\r\n"
     ].join("\r\n"));
   });

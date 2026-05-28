@@ -1316,6 +1316,8 @@ function handleNegotiatorSocket(clientSocket) {
   let privateGoal = "";
   let userApproved = false;
   let lastClientMessageAt = Date.now();
+  let clientAudioChunks = 0;
+  let aiAudioChunks = 0;
   const transcript = [];
   const heartbeat = setInterval(() => {
     if (Date.now() - lastClientMessageAt > 45000) {
@@ -1343,6 +1345,9 @@ function handleNegotiatorSocket(clientSocket) {
     });
 
     openAiSocket.on("open", () => {
+      voiceLog("realtime_session_connected", {
+        model: realtimeModel
+      });
       openAiSocket.send(JSON.stringify(buildNegotiatorSession(privateGoal)));
       openAiSocket.send(JSON.stringify(buildStartResponse(privateGoal)));
       const providerLanguage = extractGoalField(privateGoal, "Provider language") || "Thai";
@@ -1358,8 +1363,37 @@ function handleNegotiatorSocket(clientSocket) {
         return;
       }
 
+      if (
+        event.type === "input_audio_buffer.speech_started"
+        || event.type === "input_audio_buffer.speech_stopped"
+      ) {
+        const speaking = event.type.endsWith("speech_started");
+        voiceLog(speaking ? "provider_speech_started" : "provider_speech_stopped");
+        sendClient(clientSocket, {
+          type: speaking ? "provider_speaking" : "status",
+          message: speaking ? "Provider speaking..." : "AI Thinking"
+        });
+      }
+
       if (event.type === "response.audio.delta" || event.type === "response.output_audio.delta") {
+        aiAudioChunks += 1;
+        if (aiAudioChunks === 1 || aiAudioChunks % 50 === 0) {
+          voiceLog("ai_audio_chunk_received", {
+            chunks: aiAudioChunks
+          });
+        }
         sendClient(clientSocket, { type: "audio_delta", audio: event.delta });
+      }
+
+      if (
+        event.type === "response.audio.done"
+        || event.type === "response.output_audio.done"
+      ) {
+        voiceLog("ai_audio_done", {
+          chunks: aiAudioChunks
+        });
+        sendClient(clientSocket, { type: "ai_audio_done" });
+        aiAudioChunks = 0;
       }
 
       if (
@@ -1379,6 +1413,7 @@ function handleNegotiatorSocket(clientSocket) {
       }
 
       if (event.type === "response.done") {
+        sendClient(clientSocket, { type: "response_done" });
         sendClient(clientSocket, {
           type: "summary",
           summary: userApproved
@@ -1424,11 +1459,20 @@ function handleNegotiatorSocket(clientSocket) {
     }
 
     if (message.type === "start") {
+      clientAudioChunks = 0;
+      aiAudioChunks = 0;
       connectOpenAI(message.goal || "");
       return;
     }
 
     if (message.type === "audio" && openAiSocket?.readyState === SimpleWebSocket.OPEN) {
+      clientAudioChunks += 1;
+      if (clientAudioChunks === 1 || clientAudioChunks % 50 === 0) {
+        voiceLog("backend_received_realtime_audio", {
+          chunks: clientAudioChunks,
+          base64Length: String(message.audio || "").length
+        });
+      }
       openAiSocket.send(JSON.stringify({
         type: "input_audio_buffer.append",
         audio: message.audio
