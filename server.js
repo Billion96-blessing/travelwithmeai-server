@@ -1248,12 +1248,15 @@ function buildNegotiatorSession(goal) {
       type: "realtime",
       model: realtimeModel,
       instructions: `${buildNegotiatorInstructions(providerLanguage, userLanguage, goal)}\n\nPrivate user goal: ${goal}`,
-      output_modalities: ["audio", "text"],
+      output_modalities: ["audio"],
       audio: {
         input: {
           format: {
             type: "audio/pcm",
             rate: 24000
+          },
+          transcription: {
+            model: "gpt-4o-mini-transcribe"
           },
           turn_detection: {
             type: "server_vad",
@@ -1282,7 +1285,7 @@ function buildApprovalResponse(goal) {
   return {
     type: "response.create",
     response: {
-      modalities: ["audio", "text"],
+      output_modalities: ["audio"],
       instructions: [
         "The user approved the proposed deal.",
         `Now confirm the final agreement politely in ${providerLanguage} with the provider.`,
@@ -1298,7 +1301,7 @@ function buildStartResponse(goal) {
   return {
     type: "response.create",
     response: {
-      modalities: ["audio", "text"],
+      output_modalities: ["audio"],
       instructions: [
         `Start the negotiation in ${providerLanguage}.`,
         `Speak only ${providerLanguage} to the provider.`,
@@ -1318,6 +1321,8 @@ function handleNegotiatorSocket(clientSocket) {
   let lastClientMessageAt = Date.now();
   let clientAudioChunks = 0;
   let aiAudioChunks = 0;
+  let currentResponseHadAudio = false;
+  let sessionReady = false;
   const transcript = [];
   const heartbeat = setInterval(() => {
     if (Date.now() - lastClientMessageAt > 45000) {
@@ -1349,9 +1354,7 @@ function handleNegotiatorSocket(clientSocket) {
         model: realtimeModel
       });
       openAiSocket.send(JSON.stringify(buildNegotiatorSession(privateGoal)));
-      openAiSocket.send(JSON.stringify(buildStartResponse(privateGoal)));
-      const providerLanguage = extractGoalField(privateGoal, "Provider language") || "Thai";
-      sendClient(clientSocket, { type: "status", message: `Negotiator connected. Listening in ${providerLanguage}.` });
+      sendClient(clientSocket, { type: "status", message: "Preparing live voice session..." });
     });
 
     openAiSocket.on("message", (raw) => {
@@ -1375,7 +1378,24 @@ function handleNegotiatorSocket(clientSocket) {
         });
       }
 
+      if (event.type === "session.updated" && !sessionReady) {
+        sessionReady = true;
+        voiceLog("realtime_session_ready");
+        sendClient(clientSocket, {
+          type: "realtime_ready",
+          message: "Connected",
+          listen: false
+        });
+        openAiSocket.send(JSON.stringify(buildStartResponse(privateGoal)));
+      }
+
+      if (event.type === "response.created") {
+        currentResponseHadAudio = false;
+        aiAudioChunks = 0;
+      }
+
       if (event.type === "response.audio.delta" || event.type === "response.output_audio.delta") {
+        currentResponseHadAudio = true;
         aiAudioChunks += 1;
         if (aiAudioChunks === 1 || aiAudioChunks % 50 === 0) {
           voiceLog("ai_audio_chunk_received", {
@@ -1413,13 +1433,14 @@ function handleNegotiatorSocket(clientSocket) {
       }
 
       if (event.type === "response.done") {
-        sendClient(clientSocket, { type: "response_done" });
+        sendClient(clientSocket, { type: "response_done", hadAudio: currentResponseHadAudio });
         sendClient(clientSocket, {
           type: "summary",
           summary: userApproved
             ? "Final agreement confirmed. Save the Trip Notes below."
             : "Review the current offer. The AI will not confirm a final deal until you approve."
         });
+        currentResponseHadAudio = false;
       }
 
       if (event.type === "error") {
@@ -1461,6 +1482,8 @@ function handleNegotiatorSocket(clientSocket) {
     if (message.type === "start") {
       clientAudioChunks = 0;
       aiAudioChunks = 0;
+      currentResponseHadAudio = false;
+      sessionReady = false;
       connectOpenAI(message.goal || "");
       return;
     }
