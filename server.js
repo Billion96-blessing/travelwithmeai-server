@@ -57,11 +57,12 @@ const mimeTypes = {
   ".svg": "image/svg+xml"
 };
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, extraHeaders = {}) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     ...securityHeaders(),
-    ...corsHeaders()
+    ...corsHeaders(),
+    ...extraHeaders
   });
   res.end(JSON.stringify(payload));
 }
@@ -614,7 +615,10 @@ async function handleRealtimeToken(req, res) {
   }
 
   try {
-    const { goal, mode } = await readBody(req);
+    const tokenInput = req.method === "GET"
+      ? readRealtimeTokenQuery(req)
+      : await readBody(req);
+    const { goal, mode } = tokenInput;
     const cleanGoal = goal?.trim() || "Help the user negotiate politely and fairly.";
     const providerLanguage = extractGoalField(cleanGoal, "Provider language") || "Thai";
     const userLanguage = extractGoalField(cleanGoal, "User translation language") || "English";
@@ -687,10 +691,18 @@ async function handleRealtimeToken(req, res) {
       return;
     }
 
-    sendJson(res, 200, data);
+    sendJson(res, 200, data, { "Cache-Control": "no-store" });
   } catch (error) {
     sendJson(res, error.status || 500, { error: publicError(error) });
   }
+}
+
+function readRealtimeTokenQuery(req) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  return {
+    goal: url.searchParams.get("goal") || "",
+    mode: url.searchParams.get("mode") || "negotiator"
+  };
 }
 
 async function transcribeVoiceTurn({ audioBase64, audioMimeType, providerLanguage }) {
@@ -1127,6 +1139,8 @@ function buildUserRequestSummary(goal) {
 }
 
 const server = http.createServer((req, res) => {
+  const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       ...securityHeaders(),
@@ -1136,7 +1150,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/api/health") {
+  if (req.method === "GET" && requestUrl.pathname === "/api/health") {
     sendJson(res, 200, {
       ok: true,
       service: "travelwithmeai-server",
@@ -1172,7 +1186,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/realtime-token") {
+  if (
+    (req.method === "GET" || req.method === "POST") &&
+    requestUrl.pathname === "/api/realtime-token"
+  ) {
     handleRealtimeToken(req, res);
     return;
   }

@@ -62,6 +62,18 @@ Production health check:
 GET /api/health
 ```
 
+Production realtime token endpoint:
+
+```text
+GET /api/realtime-token
+GET /api/realtime-token?mode=negotiator&goal=Provider%20language%3A%20Thai
+POST /api/realtime-token
+```
+
+This endpoint creates an OpenAI Realtime ephemeral client secret/session from the
+backend. Flutter must call this endpoint instead of reading `OPENAI_API_KEY`.
+Keep `OPENAI_API_KEY` only in Render environment variables.
+
 The Flutter app should use `https://travelwithmeai-server.onrender.com` by default. When the custom domain is ready, rebuild the app with:
 
 ```bash
